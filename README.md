@@ -67,7 +67,7 @@ Astrbot/
                 |-- README.md                # 插件说明
                 |-- _conf_schema.json        # 插件可配置数据
                 │-- requirements.txt         # 依赖列表
-                │-- 喵呜可爱字.ttf            # 字体文件
+                │-- miaowu_cute_font.ttf            # 字体文件
                 │-- images/                  # 图片缓存目录
 ```
 
@@ -87,7 +87,7 @@ Astrbot/
    - 首次运行会自动创建数据文件
 
 4. **字体文件**：
-   - 确保`喵呜可爱字.ttf`字体文件存在
+   - 确保`miaowu_cute_font.ttf`字体文件存在
    - 用于生成图文卡片
 
 5. **使用命令**：
