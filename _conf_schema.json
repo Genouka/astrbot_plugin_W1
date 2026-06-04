@@ -6,6 +6,34 @@
     "default": "https://api.fuchenboke.cn/api/dongman.php",
     "obvious_hint": true
   },
+  "BASE_INCOME": {
+    "description": "基础签到收入",
+    "type": "float",
+    "hint": "每次签到获得的基础金币数",
+    "default": 100.0,
+    "obvious_hint": true
+  },
+  "STOCK_REFRESH_INTERVAL": {
+    "description": "股票刷新间隔（秒）",
+    "type": "int",
+    "hint": "股票价格自动刷新的时间间隔，单位为秒",
+    "default": 300,
+    "obvious_hint": true
+  },
+  "TRADING_HOURS_START": {
+    "description": "交易开始时间（时）",
+    "type": "int",
+    "hint": "股票交易开始的小时数（0-23）",
+    "default": 8,
+    "obvious_hint": true
+  },
+  "TRADING_HOURS_END": {
+    "description": "交易结束时间（时）",
+    "type": "int",
+    "hint": "股票交易结束的小时数（0-23）",
+    "default": 18,
+    "obvious_hint": true
+  },
   "LOTTERY_CONFIG": {
     "description": "彩票系统配置",
     "type": "object",
@@ -46,6 +74,502 @@
         "type": "int",
         "hint": "拥有此数量以上性奴的用户禁止购买彩票",
         "default": 3
+      }
+    }
+  },
+  "WEALTH_LEVELS": {
+    "description": "财富等级配置",
+    "type": "object",
+    "hint": "定义财富等级的门槛、名称和加成倍率",
+    "items": {
+      "平民": {
+        "description": "平民等级",
+        "type": "object",
+        "hint": "资产低于500时的等级",
+        "items": {
+          "min_coin": {
+            "description": "最低资产门槛",
+            "type": "int",
+            "hint": "达到此资产值升为此等级",
+            "default": 0
+          },
+          "rate": {
+            "description": "加成倍率",
+            "type": "float",
+            "hint": "签到收入加成倍率",
+            "default": 0.25
+          }
+        }
+      },
+      "小资": {
+        "description": "小资等级",
+        "type": "object",
+        "hint": "资产500-2000时的等级",
+        "items": {
+          "min_coin": {
+            "description": "最低资产门槛",
+            "type": "int",
+            "hint": "达到此资产值升为此等级",
+            "default": 500
+          },
+          "rate": {
+            "description": "加成倍率",
+            "type": "float",
+            "hint": "签到收入加成倍率",
+            "default": 0.5
+          }
+        }
+      },
+      "富豪": {
+        "description": "富豪等级",
+        "type": "object",
+        "hint": "资产2000-5000时的等级",
+        "items": {
+          "min_coin": {
+            "description": "最低资产门槛",
+            "type": "int",
+            "hint": "达到此资产值升为此等级",
+            "default": 2000
+          },
+          "rate": {
+            "description": "加成倍率",
+            "type": "float",
+            "hint": "签到收入加成倍率",
+            "default": 0.75
+          }
+        }
+      },
+      "巨擘": {
+        "description": "巨擘等级",
+        "type": "object",
+        "hint": "资产5000-10000时的等级",
+        "items": {
+          "min_coin": {
+            "description": "最低资产门槛",
+            "type": "int",
+            "hint": "达到此资产值升为此等级",
+            "default": 5000
+          },
+          "rate": {
+            "description": "加成倍率",
+            "type": "float",
+            "hint": "签到收入加成倍率",
+            "default": 1.0
+          }
+        }
+      },
+      "成功人士": {
+        "description": "成功人士等级",
+        "type": "object",
+        "hint": "资产10000以上时的等级",
+        "items": {
+          "min_coin": {
+            "description": "最低资产门槛",
+            "type": "int",
+            "hint": "达到此资产值升为此等级",
+            "default": 10000
+          },
+          "rate": {
+            "description": "加成倍率",
+            "type": "float",
+            "hint": "签到收入加成倍率",
+            "default": 1.25
+          }
+        }
+      }
+    }
+  },
+  "WEALTH_BASE_VALUES": {
+    "description": "财富等级基础值",
+    "type": "object",
+    "hint": "各财富等级对应的基础值，用于计算收益",
+    "items": {
+      "平民": {
+        "description": "平民基础值",
+        "type": "int",
+        "hint": "平民等级的基础值",
+        "default": 100
+      },
+      "小资": {
+        "description": "小资基础值",
+        "type": "int",
+        "hint": "小资等级的基础值",
+        "default": 500
+      },
+      "富豪": {
+        "description": "富豪基础值",
+        "type": "int",
+        "hint": "富豪等级的基础值",
+        "default": 2000
+      },
+      "巨擘": {
+        "description": "巨擘基础值",
+        "type": "int",
+        "hint": "巨擘等级的基础值",
+        "default": 5000
+      },
+      "成功人士": {
+        "description": "成功人士基础值",
+        "type": "int",
+        "hint": "成功人士等级的基础值",
+        "default": 10000
+      }
+    }
+  },
+  "RELATION_LIMITS": {
+    "description": "关系数量限制",
+    "type": "object",
+    "hint": "各关系类型允许的最大数量，-1表示无限制",
+    "items": {
+      "lover": {
+        "description": "恋人关系限制",
+        "type": "int",
+        "hint": "恋人关系最大数量，-1为无限制",
+        "default": 1
+      },
+      "brother": {
+        "description": "兄弟关系限制",
+        "type": "int",
+        "hint": "兄弟关系最大数量，-1为无限制",
+        "default": -1
+      },
+      "patron": {
+        "description": "包养关系限制",
+        "type": "int",
+        "hint": "包养关系最大数量，-1为无限制",
+        "default": -1
+      },
+      "spouse": {
+        "description": "夫妻关系限制",
+        "type": "int",
+        "hint": "夫妻关系最大数量，-1为无限制",
+        "default": 1
+      },
+      "sworn_brother": {
+        "description": "结义兄弟关系限制",
+        "type": "int",
+        "hint": "结义兄弟关系最大数量，-1为无限制",
+        "default": -1
+      },
+      "long_term_patron": {
+        "description": "长期包养关系限制",
+        "type": "int",
+        "hint": "长期包养关系最大数量，-1为无限制",
+        "default": -1
+      },
+      "bff": {
+        "description": "闺蜜关系限制",
+        "type": "int",
+        "hint": "闺蜜关系最大数量，-1为无限制",
+        "default": -1
+      },
+      "yuri": {
+        "description": "百合关系限制",
+        "type": "int",
+        "hint": "百合关系最大数量，-1为无限制",
+        "default": -1
+      }
+    }
+  },
+  "RELATION_UPGRADES": {
+    "description": "关系升级映射",
+    "type": "object",
+    "hint": "基础关系可升级到的目标关系类型",
+    "items": {
+      "lover": {
+        "description": "恋人升级目标",
+        "type": "string",
+        "hint": "恋人关系可升级为的关系类型",
+        "default": "spouse"
+      },
+      "brother": {
+        "description": "兄弟升级目标",
+        "type": "string",
+        "hint": "兄弟关系可升级为的关系类型",
+        "default": "sworn_brother"
+      },
+      "patron": {
+        "description": "包养升级目标",
+        "type": "string",
+        "hint": "包养关系可升级为的关系类型",
+        "default": "long_term_patron"
+      },
+      "bff": {
+        "description": "闺蜜升级目标",
+        "type": "string",
+        "hint": "闺蜜关系可升级为的关系类型",
+        "default": "yuri"
+      }
+    }
+  },
+  "UPGRADE_ITEMS": {
+    "description": "关系升级所需道具",
+    "type": "object",
+    "hint": "升级到目标关系所需的道具名称",
+    "items": {
+      "spouse": {
+        "description": "升级夫妻所需道具",
+        "type": "string",
+        "hint": "升级为夫妻所需的道具名称",
+        "default": "永恒钻戒"
+      },
+      "sworn_brother": {
+        "description": "升级结义兄弟所需道具",
+        "type": "string",
+        "hint": "升级为结义兄弟所需的道具名称",
+        "default": "金兰谱"
+      },
+      "long_term_patron": {
+        "description": "升级长期包养所需道具",
+        "type": "string",
+        "hint": "升级为长期包养所需的道具名称",
+        "default": "白金卡"
+      },
+      "yuri": {
+        "description": "升级百合所需道具",
+        "type": "string",
+        "hint": "升级为百合所需的道具名称",
+        "default": "百合花蜜"
+      }
+    }
+  },
+  "UPGRADE_BONUS": {
+    "description": "关系升级签到加成",
+    "type": "object",
+    "hint": "升级后的关系类型对应的签到加成值",
+    "items": {
+      "spouse": {
+        "description": "夫妻签到加成",
+        "type": "float",
+        "hint": "夫妻关系的签到加成值",
+        "default": 15.0
+      },
+      "sworn_brother": {
+        "description": "结义兄弟签到加成",
+        "type": "float",
+        "hint": "结义兄弟关系的签到加成值",
+        "default": 10.0
+      },
+      "yuri": {
+        "description": "百合签到加成",
+        "type": "float",
+        "hint": "百合关系的签到加成值",
+        "default": 10.0
+      },
+      "long_term_patron": {
+        "description": "长期包养签到加成",
+        "type": "float",
+        "hint": "长期包养关系的签到加成值",
+        "default": 20.0
+      }
+    }
+  },
+  "BASE_RELATION_BONUS": {
+    "description": "基础关系签到加成",
+    "type": "object",
+    "hint": "基础关系类型对应的签到加成值",
+    "items": {
+      "lover": {
+        "description": "恋人签到加成",
+        "type": "float",
+        "hint": "恋人关系的签到加成值",
+        "default": 5.0
+      },
+      "brother": {
+        "description": "兄弟签到加成",
+        "type": "float",
+        "hint": "兄弟关系的签到加成值",
+        "default": 3.0
+      },
+      "patron": {
+        "description": "包养签到加成",
+        "type": "float",
+        "hint": "包养关系的签到加成值",
+        "default": 8.0
+      },
+      "bff": {
+        "description": "闺蜜签到加成",
+        "type": "float",
+        "hint": "闺蜜关系的签到加成值",
+        "default": 4.0
+      }
+    }
+  },
+  "RELATION_TYPE_NAMES": {
+    "description": "关系类型名称映射",
+    "type": "object",
+    "hint": "关系类型内部标识到中文名称的映射",
+    "items": {
+      "lover": {
+        "description": "恋人名称",
+        "type": "string",
+        "hint": "lover关系的中文名称",
+        "default": "恋人"
+      },
+      "brother": {
+        "description": "兄弟名称",
+        "type": "string",
+        "hint": "brother关系的中文名称",
+        "default": "兄弟"
+      },
+      "patron": {
+        "description": "包养关系名称",
+        "type": "string",
+        "hint": "patron关系的中文名称",
+        "default": "包养关系"
+      },
+      "spouse": {
+        "description": "夫妻名称",
+        "type": "string",
+        "hint": "spouse关系的中文名称",
+        "default": "夫妻"
+      },
+      "sworn_brother": {
+        "description": "结义兄弟名称",
+        "type": "string",
+        "hint": "sworn_brother关系的中文名称",
+        "default": "结义兄弟"
+      },
+      "long_term_patron": {
+        "description": "长期包养名称",
+        "type": "string",
+        "hint": "long_term_patron关系的中文名称",
+        "default": "长期包养"
+      },
+      "bff": {
+        "description": "闺蜜名称",
+        "type": "string",
+        "hint": "bff关系的中文名称",
+        "default": "闺蜜"
+      },
+      "yuri": {
+        "description": "百合名称",
+        "type": "string",
+        "hint": "yuri关系的中文名称",
+        "default": "百合"
+      }
+    }
+  },
+  "RELATION_GIFT_BONUS": {
+    "description": "关系礼物加成",
+    "type": "object",
+    "hint": "不同关系类型下赠送特定道具的好感度加成范围",
+    "items": {
+      "lover": {
+        "description": "恋人礼物加成",
+        "type": "object",
+        "hint": "恋人关系下各礼物的加成范围",
+        "items": {
+          "玫瑰花束": {
+            "description": "玫瑰花束加成",
+            "type": "string",
+            "hint": "格式: 最小值,最大值",
+            "default": "10,15"
+          },
+          "定制蛋糕": {
+            "description": "定制蛋糕加成",
+            "type": "string",
+            "hint": "格式: 最小值,最大值",
+            "default": "15,25"
+          }
+        }
+      },
+      "spouse": {
+        "description": "夫妻礼物加成",
+        "type": "object",
+        "hint": "夫妻关系下各礼物的加成范围",
+        "items": {
+          "限量版玫瑰": {
+            "description": "限量版玫瑰加成",
+            "type": "string",
+            "hint": "格式: 最小值,最大值",
+            "default": "15,25"
+          },
+          "定制珠宝": {
+            "description": "定制珠宝加成",
+            "type": "string",
+            "hint": "格式: 最小值,最大值",
+            "default": "20,35"
+          }
+        }
+      },
+      "brother": {
+        "description": "兄弟礼物加成",
+        "type": "object",
+        "hint": "兄弟关系下各礼物的加成范围",
+        "items": {
+          "一壶烈酒": {
+            "description": "一壶烈酒加成",
+            "type": "string",
+            "hint": "格式: 最小值,最大值",
+            "default": "8,15"
+          }
+        }
+      },
+      "sworn_brother": {
+        "description": "结义兄弟礼物加成",
+        "type": "object",
+        "hint": "结义兄弟关系下各礼物的加成范围",
+        "items": {
+          "金兰谱": {
+            "description": "金兰谱加成",
+            "type": "string",
+            "hint": "格式: 最小值,最大值",
+            "default": "15,25"
+          }
+        }
+      },
+      "patron": {
+        "description": "包养礼物加成",
+        "type": "object",
+        "hint": "包养关系下各礼物的加成范围",
+        "items": {
+          "黑金卡": {
+            "description": "黑金卡加成",
+            "type": "string",
+            "hint": "格式: 最小值,最大值",
+            "default": "10,20"
+          }
+        }
+      },
+      "long_term_patron": {
+        "description": "长期包养礼物加成",
+        "type": "object",
+        "hint": "长期包养关系下各礼物的加成范围",
+        "items": {
+          "白金卡": {
+            "description": "白金卡加成",
+            "type": "string",
+            "hint": "格式: 最小值,最大值",
+            "default": "20,30"
+          }
+        }
+      },
+      "bff": {
+        "description": "闺蜜礼物加成",
+        "type": "object",
+        "hint": "闺蜜关系下各礼物的加成范围",
+        "items": {
+          "百合花种": {
+            "description": "百合花种加成",
+            "type": "string",
+            "hint": "格式: 最小值,最大值",
+            "default": "20,30"
+          }
+        }
+      },
+      "yuri": {
+        "description": "百合礼物加成",
+        "type": "object",
+        "hint": "百合关系下各礼物的加成范围",
+        "items": {
+          "百合花蜜": {
+            "description": "百合花蜜加成",
+            "type": "string",
+            "hint": "格式: 最小值,最大值",
+            "default": "20,30"
+          }
+        }
       }
     }
   }

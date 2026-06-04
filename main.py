@@ -724,6 +724,53 @@ class ContractSystem(Star):
         self.MAX_LOTTERY_PER_DAY = lottery_config.get("max_use_per_day", 10)
         self.MAX_CONTRACTORS_FOR_LOTTERY = lottery_config.get("max_contractors", 3)
         
+        # 基础经济配置
+        self.BASE_INCOME = self.config.get("BASE_INCOME", 100.0)
+        self.STOCK_REFRESH_INTERVAL = self.config.get("STOCK_REFRESH_INTERVAL", 300)
+        self.TRADING_HOURS = (
+            self.config.get("TRADING_HOURS_START", 8),
+            self.config.get("TRADING_HOURS_END", 18)
+        )
+        
+        # 财富等级配置
+        wealth_levels_config = self.config.get("WEALTH_LEVELS", {})
+        self.WEALTH_LEVELS = []
+        for name, cfg in wealth_levels_config.items():
+            min_coin = cfg.get("min_coin", 0) if isinstance(cfg, dict) else 0
+            rate = cfg.get("rate", 0.25) if isinstance(cfg, dict) else 0.25
+            self.WEALTH_LEVELS.append((min_coin, name, rate))
+        # 确保按门槛升序排列
+        self.WEALTH_LEVELS.sort(key=lambda x: x[0])
+        
+        wealth_base_config = self.config.get("WEALTH_BASE_VALUES", {})
+        self.WEALTH_BASE_VALUES = {}
+        for name, val in wealth_base_config.items():
+            self.WEALTH_BASE_VALUES[name] = val if isinstance(val, (int, float)) else 100
+        
+        # 关系系统配置
+        self.RELATION_LIMITS = self.config.get("RELATION_LIMITS", RELATION_LIMITS)
+        self.RELATION_UPGRADES = self.config.get("RELATION_UPGRADES", RELATION_UPGRADES)
+        self.UPGRADE_ITEMS = self.config.get("UPGRADE_ITEMS", UPGRADE_ITEMS)
+        self.UPGRADE_BONUS = self.config.get("UPGRADE_BONUS", UPGRADE_BONUS)
+        self.BASE_RELATION_BONUS = self.config.get("BASE_RELATION_BONUS", BASE_RELATION_BONUS)
+        self.RELATION_TYPE_NAMES = self.config.get("RELATION_TYPE_NAMES", RELATION_TYPE_NAMES)
+        
+        # 关系礼物加成配置（从字符串格式解析为元组）
+        gift_bonus_config = self.config.get("RELATION_GIFT_BONUS", {})
+        self.RELATION_GIFT_BONUS = {}
+        for rel_type, gifts in gift_bonus_config.items():
+            if isinstance(gifts, dict):
+                self.RELATION_GIFT_BONUS[rel_type] = {}
+                for gift_name, val in gifts.items():
+                    if isinstance(val, str) and ',' in val:
+                        parts = val.split(',')
+                        self.RELATION_GIFT_BONUS[rel_type][gift_name] = (int(parts[0]), int(parts[1]))
+                    elif isinstance(val, (list, tuple)) and len(val) == 2:
+                        self.RELATION_GIFT_BONUS[rel_type][gift_name] = tuple(val)
+                    else:
+                        # 回退到模块级默认值
+                        self.RELATION_GIFT_BONUS[rel_type][gift_name] = RELATION_GIFT_BONUS.get(rel_type, {}).get(gift_name, (0, 0))
+        
         # 初始化其他变量
         self.active_invitations = {}
         self.pending_confirmations = {}
@@ -1067,7 +1114,7 @@ class ContractSystem(Star):
         user_data = self._get_user_social_data(group_id, user_id)
         for rel_type, targets in user_data["relations"].items():
             if str(target_id) in targets:
-                return RELATION_TYPE_NAMES.get(rel_type, rel_type)
+                return self.RELATION_TYPE_NAMES.get(rel_type, rel_type)
         return None
 
     def add_relation(self, group_id: str, user_id: str, target_id: str, relation_type: str):
@@ -1106,7 +1153,7 @@ class ContractSystem(Star):
             relation_type = self.RELATION_NAME_TO_TYPE[relation_type]
     
         user_data = self._get_user_social_data(group_id, user_id)
-        limit = RELATION_LIMITS.get(relation_type, 0)
+        limit = self.RELATION_LIMITS.get(relation_type, 0)
     
         if limit == -1:  # 无限制
             return True
@@ -1117,8 +1164,8 @@ class ContractSystem(Star):
     def get_upgraded_relation(self, group_id: str, user_id: str, target_id: str) -> Optional[str]:
         """获取升级后的特殊关系"""
         basic_relation = self.get_special_relation(group_id, user_id, target_id)
-        if basic_relation in RELATION_UPGRADES:
-            return RELATION_UPGRADES[basic_relation]
+        if basic_relation in self.RELATION_UPGRADES:
+            return self.RELATION_UPGRADES[basic_relation]
         return None
     
     def get_relation_bonus(self, group_id: str, user_id: str) -> float:
@@ -1127,14 +1174,14 @@ class ContractSystem(Star):
         bonus = 0.0
         
         # 基础关系加成
-        for rel_type in BASE_RELATION_BONUS:
+        for rel_type in self.BASE_RELATION_BONUS:
             if user_data["relations"][rel_type]:
-                bonus += BASE_RELATION_BONUS[rel_type]
+                bonus += self.BASE_RELATION_BONUS[rel_type]
         
         # 升级关系加成
-        for rel_type in UPGRADE_BONUS:
+        for rel_type in self.UPGRADE_BONUS:
             if user_data["relations"][rel_type]:
-                bonus += UPGRADE_BONUS[rel_type]
+                bonus += self.UPGRADE_BONUS[rel_type]
         
         return bonus
 
@@ -1261,7 +1308,7 @@ class ContractSystem(Star):
     def is_trading_time(self):
         """检查当前是否在交易时间内"""
         now = datetime.now()
-        return TRADING_HOURS[0] <= now.hour < TRADING_HOURS[1]
+        return self.TRADING_HOURS[0] <= now.hour < self.TRADING_HOURS[1]
     #endregion
 
     #region 用户身价计算
@@ -1273,7 +1320,7 @@ class ContractSystem(Star):
         wealth_level = "平民"
         wealth_rate = 0.25
         
-        for min_coin, level, rate in WEALTH_LEVELS:
+        for min_coin, level, rate in self.WEALTH_LEVELS:
             if total_wealth >= min_coin:
                 wealth_level = level
                 wealth_rate = rate
@@ -1285,7 +1332,7 @@ class ContractSystem(Star):
     def _calculate_wealth(self, user_data: dict) -> float:
         """计算用户身价（基于财富等级）"""
         wealth_level, _ = self._get_wealth_info(user_data)
-        return WEALTH_BASE_VALUES.get(wealth_level, 100)
+        return self.WEALTH_BASE_VALUES.get(wealth_level, 100)
     #endregion
 
     #region 授权管理员控件
@@ -1786,7 +1833,7 @@ class ContractSystem(Star):
         
         if data.get('is_query'):
             # 计算加成后的基础收益
-            base_with_bonus = BASE_INCOME * (1 + data['user_wealth_rate'])
+            base_with_bonus = self.BASE_INCOME * (1 + data['user_wealth_rate'])
             contract_bonus = sum(
                 self._get_wealth_info(
                     self._get_user_data(data['group_id'], c)
@@ -2193,7 +2240,7 @@ class ContractSystem(Star):
         
         # 财富等级描述
         level_desc = ""
-        for min_coin, name, rate in WEALTH_LEVELS:
+        for min_coin, name, rate in self.WEALTH_LEVELS:
             if data["total_assets"] >= min_coin:
                 level_desc = f"达到{name}等级需要资产 ≥ {min_coin}金币"
         
@@ -2956,7 +3003,7 @@ class ContractSystem(Star):
                     self._log_operation("info", "当前非交易时间，跳过股票刷新")
                 
                 # 每3分钟刷新一次
-                await asyncio.sleep(STOCK_REFRESH_INTERVAL)
+                await asyncio.sleep(self.STOCK_REFRESH_INTERVAL)
             except Exception as e:
                 self._log_operation("error", f"刷新股票价格失败: {str(e)}")
                 await asyncio.sleep(60)  # 出错后等待1分钟
@@ -4414,7 +4461,7 @@ class ContractSystem(Star):
         time_data = self._get_user_time_data(group_id, user_id)
         
         # 计算签到加成信息
-        base_income = BASE_INCOME
+        base_income = self.BASE_INCOME
         wealth_level, wealth_rate = self._get_wealth_info(user_data)
         wealth_bonus = base_income * wealth_rate
         
@@ -4723,7 +4770,7 @@ class ContractSystem(Star):
         relation_bonus = self.get_relation_bonus(group_id, user_id)
         
         # 计算签到收益
-        earned = BASE_INCOME * (1 + user_wealth_rate) * (1 + contractor_rates + sub_contractor_rates) + consecutive_bonus + relation_bonus
+        earned = self.BASE_INCOME * (1 + user_wealth_rate) * (1 + contractor_rates + sub_contractor_rates) + consecutive_bonus + relation_bonus
 
         user_data["coins"] += earned
         time_data["last_sign"] = now.replace(tzinfo=None).isoformat()
@@ -4801,7 +4848,7 @@ class ContractSystem(Star):
         relation_bonus = self.get_relation_bonus(group_id, user_id)
     
         # 计算预期收益
-        earned = BASE_INCOME * (1 + user_wealth_rate) * (1 + contractor_rates) + consecutive_bonus + relation_bonus
+        earned = self.BASE_INCOME * (1 + user_wealth_rate) * (1 + contractor_rates) + consecutive_bonus + relation_bonus
 
         # 生成签到卡片
         card_path = await self._generate_card(
@@ -5829,7 +5876,7 @@ class ContractSystem(Star):
         # 确定好感度增加值（根据关系类型）
         min_gain, max_gain = 5, 10
         if relation_type:
-            gift_bonus = RELATION_GIFT_BONUS.get(relation_type, {}).get(gift_name)
+            gift_bonus = self.RELATION_GIFT_BONUS.get(relation_type, {}).get(gift_name)
             if gift_bonus:
                 min_gain, max_gain = gift_bonus
         
@@ -6320,12 +6367,12 @@ class ContractSystem(Star):
             return
         
         # 检查是否可以升级
-        if current_relation not in RELATION_UPGRADES:
+        if current_relation not in self.RELATION_UPGRADES:
             yield event.plain_result(f"❌ {current_relation_chinese} 关系无法升级哦~杂鱼酱❤~")
             return
         
-        upgraded_relation = RELATION_UPGRADES[current_relation]
-        required_item = UPGRADE_ITEMS[upgraded_relation]
+        upgraded_relation = self.RELATION_UPGRADES[current_relation]
+        required_item = self.UPGRADE_ITEMS[upgraded_relation]
         
         # 检查用户是否拥有所需道具
         user_props = self._get_user_props(group_id, user_id)
@@ -6354,7 +6401,7 @@ class ContractSystem(Star):
         )
         
         target_name = await self._get_at_user_name(event, target_id)
-        new_relation_name = RELATION_TYPE_NAMES.get(upgraded_relation, upgraded_relation)
+        new_relation_name = self.RELATION_TYPE_NAMES.get(upgraded_relation, upgraded_relation)
         yield event.plain_result(f"✨ 恭喜！你与 {target_name} 的关系从 {current_relation_chinese} 升级为 {new_relation_name}！")
 
     @filter.command("解除关系")
@@ -6478,7 +6525,7 @@ class ContractSystem(Star):
         special_relations = {}
         for rel_type, targets in user_data["relations"].items():
             for target_id in targets:
-                special_relations[target_id] = RELATION_TYPE_NAMES.get(rel_type, rel_type)
+                special_relations[target_id] = self.RELATION_TYPE_NAMES.get(rel_type, rel_type)
         
         # 构建响应
         response = "🌟 你的社交网络（按好感度排序）:\n\n"
@@ -7245,7 +7292,7 @@ class ContractSystem(Star):
         """显示优化后的股票行情"""
         response = "📈 当前股票行情:\n\n"
         response += f"当前股票交易时间: 8:00-18:00\n"
-        response += f"当前股票刷新时间间隔：{STOCK_REFRESH_INTERVAL}秒\n"
+        response += f"当前股票刷新时间间隔：{self.STOCK_REFRESH_INTERVAL}秒\n"
     
         for stock_name, stock_info in self.stocks.items():
             price = stock_info["price"]
