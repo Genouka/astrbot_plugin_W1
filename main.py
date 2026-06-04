@@ -28,7 +28,7 @@ from typing import Dict, Any, Optional, List, Tuple
 #免责声明：代码中的称呼与词汇为娱乐性质，不涉及政治等敏感内容
 # 路径配置
     #基础目录
-PLUGIN_DIR = os.path.join('data', 'plugins', 'astrbot_plugin_wealthandcontract')
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 WAC_DATA_DIR= os.path.join('data', 'plugins_WealthAndContract_data')
 
     #配置文件
