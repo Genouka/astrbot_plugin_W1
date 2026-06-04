@@ -45,7 +45,7 @@ CERTIFICATE_DATA_FILE = os.path.join(WAC_DATA_DIR, 'certificate_data.json')  # �
 
     #插件依赖
 IMAGE_DIR = os.path.join(PLUGIN_DIR, 'images')
-FONT_PATH = os.path.join(PLUGIN_DIR, '喵呜可爱字.ttf')
+FONT_PATH = os.path.join(PLUGIN_DIR, 'miaowu_cute_font.ttf')
 
     #插件工作初始值
 STOCK_REFRESH_INTERVAL = 300    # 5分钟刷新一次股票
