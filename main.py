@@ -754,7 +754,13 @@ class ContractSystem(Star):
                     json.dump({}, f)
                     
         if not os.path.exists(FONT_PATH):
-            raise FileNotFoundError(f"字体文件缺失: {FONT_PATH}")
+            # 尝试从插件源码目录复制字体文件
+            src_font = os.path.join(os.path.dirname(os.path.abspath(__file__)), '喵呜可爱字.ttf')
+            if os.path.exists(src_font):
+                shutil.copy2(src_font, FONT_PATH)
+                logger.info(f"已复制字体文件到 {FONT_PATH}")
+            else:
+                logger.warning(f"字体文件缺失: {FONT_PATH}，将使用默认字体")
 
     def _clean_image_dir(self):
         """清空图片目录"""
