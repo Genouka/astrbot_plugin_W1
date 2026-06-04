@@ -754,7 +754,7 @@ class ContractSystem(Star):
                     json.dump({}, f)
                     
         if not os.path.exists(FONT_PATH):
-            raise FileNotFoundError(f"字体文件缺失: {FONT_PATH}")
+            logger.warning(f"字体文件缺失: {FONT_PATH}，将使用默认字体")
 
     def _clean_image_dir(self):
         """清空图片目录"""
