@@ -45,7 +45,7 @@ CERTIFICATE_DATA_FILE = os.path.join(WAC_DATA_DIR, 'certificate_data.json')  # �
 
     #插件依赖
 IMAGE_DIR = os.path.join(PLUGIN_DIR, 'images')
-FONT_PATH = os.path.join(PLUGIN_DIR, '喵呜可爱字.ttf')
+FONT_PATH = os.path.join(PLUGIN_DIR, 'miaowu_font.ttf')
 
     #插件工作初始值
 STOCK_REFRESH_INTERVAL = 300    # 5分钟刷新一次股票
@@ -755,7 +755,7 @@ class ContractSystem(Star):
                     
         if not os.path.exists(FONT_PATH):
             # 尝试从插件源码目录复制字体文件
-            src_font = os.path.join(os.path.dirname(os.path.abspath(__file__)), '喵呜可爱字.ttf')
+            src_font = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'miaowu_font.ttf')
             if os.path.exists(src_font):
                 shutil.copy2(src_font, FONT_PATH)
                 logger.info(f"已复制字体文件到 {FONT_PATH}")
