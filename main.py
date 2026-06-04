@@ -6,6 +6,9 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig
 from datetime import datetime, timedelta
 import yaml
+import json
+import copy
+from collections import OrderedDict
 import os
 import httpx
 import pytz
@@ -29,16 +32,16 @@ PLUGIN_DIR = os.path.join('data', 'plugins', 'astrbot_plugin_wealthandcontract')
 WAC_DATA_DIR= os.path.join('data', 'plugins_WealthAndContract_data')
 
     #配置文件
-DATA_FILE = os.path.join(WAC_DATA_DIR, 'WAC_data.yml')
-PROP_DATA_FILE = os.path.join(WAC_DATA_DIR, 'WAC_propdata.yml')
-SOCIAL_DATA_FILE = os.path.join(WAC_DATA_DIR, 'WAC_social_data.yml')  # 社交数据文件
-TIME_DATA_FILE = os.path.join(WAC_DATA_DIR, 'WAC_time_data.yml')  # 时间数据文件
-STOCK_DATA_FILE = os.path.join(WAC_DATA_DIR, 'stock_data.yml')
-STOCK_USER_DATA_FILE = os.path.join(WAC_DATA_DIR, 'stock_user_data.yml')
-AUTH_DATA_FILE = os.path.join(WAC_DATA_DIR, 'WAC_auth_data.yml')
-BLACKLIST_DATA_FILE = os.path.join(WAC_DATA_DIR, 'blacklist_data.yml')
-ASSET_DATA_FILE = os.path.join(WAC_DATA_DIR, 'asset_data.yml')  # 资产数据文件路径
-CERTIFICATE_DATA_FILE = os.path.join(WAC_DATA_DIR, 'certificate_data.yml')  # 证件数据文件路径
+DATA_FILE = os.path.join(WAC_DATA_DIR, 'WAC_data.json')
+PROP_DATA_FILE = os.path.join(WAC_DATA_DIR, 'WAC_propdata.json')
+SOCIAL_DATA_FILE = os.path.join(WAC_DATA_DIR, 'WAC_social_data.json')  # 社交数据文件
+TIME_DATA_FILE = os.path.join(WAC_DATA_DIR, 'WAC_time_data.json')  # 时间数据文件
+STOCK_DATA_FILE = os.path.join(WAC_DATA_DIR, 'stock_data.json')
+STOCK_USER_DATA_FILE = os.path.join(WAC_DATA_DIR, 'stock_user_data.json')
+AUTH_DATA_FILE = os.path.join(WAC_DATA_DIR, 'WAC_auth_data.json')
+BLACKLIST_DATA_FILE = os.path.join(WAC_DATA_DIR, 'blacklist_data.json')
+ASSET_DATA_FILE = os.path.join(WAC_DATA_DIR, 'asset_data.json')  # 资产数据文件路径
+CERTIFICATE_DATA_FILE = os.path.join(WAC_DATA_DIR, 'certificate_data.json')  # 证件数据文件路径
 
     #插件依赖
 IMAGE_DIR = os.path.join(PLUGIN_DIR, 'images')
@@ -670,6 +673,20 @@ class ContractSystem(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        # 数据缓存层 - 核心性能优化
+        self._cache = {}           # {file_path: data}
+        self._dirty = set()        # 需要写入磁盘的文件路径集合
+        self._flush_interval = 30  # 每30秒刷新一次脏数据到磁盘
+        self._niuniu_cache = None  # 牛牛插件数据缓存
+        self._niuniu_cache_time = 0
+        # HTTP客户端复用
+        self._http_client = None
+        # 图片缓存
+        self._avatar_cache = {}    # {user_id: (avatar_image, timestamp)}
+        self._bg_cache = None      # (bg_image, timestamp)
+        self._bg_cache_time = 0
+        # 字体缓存
+        self._font_cache = {}      # {size: font_object}
         self._init_env()
         self.active_invitations = {}  # 存储活跃的约会邀请
         self.pending_confirmations = {} # 新增：待确认操作存储
@@ -685,6 +702,9 @@ class ContractSystem(Star):
         self.stocks = {}
         self.stock_user_data = {}
         self._init_stock_system()
+
+        # 启动定期刷新缓存到磁盘的任务
+        self._flush_task = asyncio.create_task(self._periodic_flush(self.task_token))
 
         #region 插件后台任务控件
         self.cleanup_task = asyncio.create_task(self._clean_expired_invitations(self.task_token))
@@ -717,19 +737,21 @@ class ContractSystem(Star):
     def _init_env(self):
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
         os.makedirs(os.path.dirname(PROP_DATA_FILE), exist_ok=True)
-        os.makedirs(os.path.dirname(SOCIAL_DATA_FILE), exist_ok=True)  # 社交数据目录
-        os.makedirs(os.path.dirname(TIME_DATA_FILE), exist_ok=True)  # 时间数据目录
+        os.makedirs(os.path.dirname(SOCIAL_DATA_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(TIME_DATA_FILE), exist_ok=True)
         os.makedirs(PLUGIN_DIR, exist_ok=True)
         os.makedirs(IMAGE_DIR, exist_ok=True)
         
         # 清空图片目录
         self._clean_image_dir()
         
-        # 初始化数据文件
+        # 初始化数据文件（优先JSON，兼容YML迁移）
         for file_path in [DATA_FILE, PROP_DATA_FILE, SOCIAL_DATA_FILE, TIME_DATA_FILE]:
+            yml_path = file_path.replace('.json', '.yml')
+            self._migrate_yml_to_json(yml_path, file_path)
             if not os.path.exists(file_path):
                 with open(file_path, 'w', encoding='utf-8') as f:
-                    yaml.dump({}, f)
+                    json.dump({}, f)
                     
         if not os.path.exists(FONT_PATH):
             raise FileNotFoundError(f"字体文件缺失: {FONT_PATH}")
@@ -759,71 +781,114 @@ class ContractSystem(Star):
         else:
             logger.info(message)
 
-    def _load_data(self):
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f) or {}
-        except Exception as e:
-            self._log_operation("error", f"加载主数据失败: {str(e)}")
-            return {}
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """获取复用的HTTP客户端"""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=15)
+        return self._http_client
 
-    def _save_data(self, data):
-        try:
-            with open(DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True)
-        except Exception as e:
-            self._log_operation("error", f"保存主数据失败: {str(e)}")
+    def _get_font(self, size: int) -> ImageFont.FreeTypeFont:
+        """获取缓存字体对象"""
+        if size not in self._font_cache:
+            if os.path.exists(FONT_PATH):
+                self._font_cache[size] = ImageFont.truetype(FONT_PATH, size)
+            else:
+                self._font_cache[size] = ImageFont.load_default()
+        return self._font_cache[size]
+
+    def _migrate_yml_to_json(self, yml_path: str, json_path: str):
+        """自动迁移YML数据到JSON格式"""
+        if os.path.exists(yml_path) and not os.path.exists(json_path):
+            try:
+                with open(yml_path, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f) or {}
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                logger.info(f"已迁移 {yml_path} -> {json_path}")
+            except Exception as e:
+                logger.error(f"迁移数据失败 {yml_path}: {e}")
+
+    def _cached_load(self, file_path: str) -> dict:
+        """从缓存加载数据，缓存未命中则从磁盘读取JSON（自动兼容YML）"""
+        if file_path in self._cache:
+            return self._cache[file_path]
+        
+        # 自动迁移YML到JSON
+        yml_path = file_path.replace('.json', '.yml')
+        self._migrate_yml_to_json(yml_path, file_path)
+        
+        data = {}
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, Exception) as e:
+                # JSON读取失败，尝试YML兼容读取
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = yaml.safe_load(f) or {}
+                except Exception:
+                    self._log_operation("error", f"加载数据失败: {file_path} - {e}")
+                    data = {}
+        
+        self._cache[file_path] = data
+        return data
+
+    def _cached_save(self, file_path: str, data: dict, immediate: bool = False):
+        """保存数据到缓存并标记为脏，可选立即写入磁盘"""
+        self._cache[file_path] = data
+        self._dirty.add(file_path)
+        if immediate:
+            self._flush_file(file_path)
+
+    def _flush_file(self, file_path: str):
+        """将单个文件刷新到磁盘"""
+        if file_path in self._dirty and file_path in self._cache:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(self._cache[file_path], f, ensure_ascii=False, indent=2)
+                self._dirty.discard(file_path)
+            except Exception as e:
+                self._log_operation("error", f"刷新数据到磁盘失败: {file_path} - {e}")
+
+    async def _periodic_flush(self, token: str):
+        """定期将脏数据刷新到磁盘"""
+        while True:
+            try:
+                if token != self.task_token:
+                    return
+                if self._dirty:
+                    dirty_copy = list(self._dirty)
+                    for file_path in dirty_copy:
+                        self._flush_file(file_path)
+                await asyncio.sleep(self._flush_interval)
+            except Exception as e:
+                self._log_operation("error", f"定期刷新失败: {e}")
+                await asyncio.sleep(10)
+
+    def _load_data(self):
+        return self._cached_load(DATA_FILE)
+
+    def _save_data(self, data, immediate: bool = False):
+        self._cached_save(DATA_FILE, data, immediate=immediate)
 
     def _load_time_data(self):
-        """加载时间数据"""
-        try:
-            with open(TIME_DATA_FILE, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f) or {}
-        except Exception as e:
-            self._log_operation("error", f"加载时间数据失败: {str(e)}")
-            return {}
+        return self._cached_load(TIME_DATA_FILE)
 
-    def _save_time_data(self, data):
-        """保存时间数据"""
-        try:
-            with open(TIME_DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True)
-        except Exception as e:
-            self._log_operation("error", f"保存时间数据失败: {str(e)}")
+    def _save_time_data(self, data, immediate: bool = False):
+        self._cached_save(TIME_DATA_FILE, data, immediate=immediate)
 
     def _load_prop_data(self):
-        """加载道具数据"""
-        try:
-            with open(PROP_DATA_FILE, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f) or {}
-        except Exception as e:
-            self._log_operation("error", f"加载道具数据失败: {str(e)}")
-            return {}
+        return self._cached_load(PROP_DATA_FILE)
 
-    def _save_prop_data(self, data):
-        """保存道具数据"""
-        try:
-            with open(PROP_DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True)
-        except Exception as e:
-            self._log_operation("error", f"保存道具数据失败: {str(e)}")
+    def _save_prop_data(self, data, immediate: bool = False):
+        self._cached_save(PROP_DATA_FILE, data, immediate=immediate)
 
     def _load_social_data(self) -> dict:
-        """加载社交数据"""
-        try:
-            with open(SOCIAL_DATA_FILE, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f) or {}
-        except Exception as e:
-            self._log_operation("error", f"加载社交数据失败: {str(e)}")
-            return {}
-    
-    def _save_social_data(self, data):
-        """保存社交数据"""
-        try:
-            with open(SOCIAL_DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True)
-        except Exception as e:
-            self._log_operation("error", f"保存社交数据失败: {str(e)}")
+        return self._cached_load(SOCIAL_DATA_FILE)
+
+    def _save_social_data(self, data, immediate: bool = False):
+        self._cached_save(SOCIAL_DATA_FILE, data, immediate=immediate)
     
     def _get_user_time_data(self, group_id: str, user_id: str) -> dict:
         """获取用户时间数据"""
@@ -849,8 +914,7 @@ class ContractSystem(Star):
     def _save_user_data(self, group_id: str, user_id: str, user_data: dict):
         """保存用户数据"""
         try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[user_id] = user_data
             self._save_data(data)
@@ -858,37 +922,36 @@ class ContractSystem(Star):
             self._log_operation("error", f"保存用户数据失败: {str(e)}")
 
     def _get_user_data(self, group_id: str, user_id: str) -> dict:
-        """获取用户主数据（不含时间数据）"""
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-        except Exception as e:
-            self._log_operation("error", f"加载用户数据失败: {str(e)}")
-            data = {}
-
+        """获取用户主数据（使用缓存，避免重复磁盘读取）"""
+        data = self._load_data()
         user_data = data.setdefault(group_id, {}).setdefault(user_id, {
             "coins": 0.0,
             "bank": 0.0,
             "contractors": [],
             "contracted_by": None,
             "consecutive": 0,
-            "permanent_contractors": [],  # 永久绑定性奴
-            "is_permanent": False         # 是否被永久绑定
+            "permanent_contractors": [],
+            "is_permanent": False
         })
         
-        # 加载牛牛插件数据
-        niuniu_data_path = os.path.join('data', 'niuniu_lengths.yml')
-        if os.path.exists(niuniu_data_path):
-            try:
-                with open(niuniu_data_path, 'r', encoding='utf-8') as f:
-                    niuniu_data = yaml.safe_load(f) or {}
-                niuniu_coins = niuniu_data.get(group_id, {}).get(user_id, {}).get('coins', 0.0)
-                user_data['niuniu_coins'] = niuniu_coins
-            except Exception as e:
-                self._log_operation("error", f"加载牛牛数据失败: {str(e)}")
-                user_data['niuniu_coins'] = 0.0
-        else:
-            user_data['niuniu_coins'] = 0.0
+        # 加载牛牛插件数据（带缓存，每60秒刷新一次）
+        now = time.time()
+        if self._niuniu_cache is None or (now - self._niuniu_cache_time) > 60:
+            niuniu_data_path = os.path.join('data', 'niuniu_lengths.yml')
+            if os.path.exists(niuniu_data_path):
+                try:
+                    with open(niuniu_data_path, 'r', encoding='utf-8') as f:
+                        self._niuniu_cache = yaml.safe_load(f) or {}
+                    self._niuniu_cache_time = now
+                except Exception as e:
+                    self._log_operation("error", f"加载牛牛数据失败: {str(e)}")
+                    self._niuniu_cache = {}
+            else:
+                self._niuniu_cache = {}
+                self._niuniu_cache_time = now
+        
+        niuniu_coins = self._niuniu_cache.get(group_id, {}).get(user_id, {}).get('coins', 0.0)
+        user_data['niuniu_coins'] = niuniu_coins
         
         return user_data
 
@@ -1084,6 +1147,11 @@ class ContractSystem(Star):
         os.makedirs(os.path.dirname(STOCK_DATA_FILE), exist_ok=True)
         os.makedirs(os.path.dirname(STOCK_USER_DATA_FILE), exist_ok=True)
         
+        # 迁移YML到JSON
+        for fp in [STOCK_DATA_FILE, STOCK_USER_DATA_FILE]:
+            yml_path = fp.replace('.json', '.yml')
+            self._migrate_yml_to_json(yml_path, fp)
+        
         # 加载股票数据
         self.stocks = self._load_stock_data()
         
@@ -1095,7 +1163,7 @@ class ContractSystem(Star):
         if os.path.exists(STOCK_USER_DATA_FILE):
             try:
                 with open(STOCK_USER_DATA_FILE, 'r', encoding='utf-8') as f:
-                    return yaml.safe_load(f) or {}
+                    return json.load(f)
             except Exception as e:
                 self._log_operation("error", f"加载用户股票数据失败: {str(e)}")
                 return {}
@@ -1108,7 +1176,7 @@ class ContractSystem(Star):
         if os.path.exists(STOCK_DATA_FILE):
             try:
                 with open(STOCK_DATA_FILE, 'r', encoding='utf-8') as f:
-                    saved_data = yaml.safe_load(f) or {}
+                    saved_data = json.load(f)
                     
                     for name, info in saved_data.items():
                         # 恢复基础数据
@@ -1164,28 +1232,15 @@ class ContractSystem(Star):
                 save_data[name] = save_info
             
             with open(STOCK_DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(save_data, f, allow_unicode=True)
+                json.dump(save_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self._log_operation("error", f"保存股票数据失败: {str(e)}")
-        
-        # 加载用户股票数据（防止重载时丢失）
-        self.stock_user_data = {}
-        if os.path.exists(STOCK_USER_DATA_FILE):
-            try:
-                with open(STOCK_USER_DATA_FILE, 'r', encoding='utf-8') as f:
-                    self.stock_user_data = yaml.safe_load(f) or {}
-            except Exception as e:
-                self._log_operation("error", f"加载用户股票数据失败: {str(e)}")
-        
-        # 保存用户股票数据（确保文件存在）
-        if not os.path.exists(STOCK_USER_DATA_FILE):
-            self._save_user_stock_data()
 
     def _save_user_stock_data(self):
         """保存用户股票数据（确保数据完整）"""
         try:
             with open(STOCK_USER_DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(self.stock_user_data, f, allow_unicode=True)
+                json.dump(self.stock_user_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self._log_operation("error", f"保存用户股票数据失败: {str(e)}")
 
@@ -1236,10 +1291,12 @@ class ContractSystem(Star):
     #region 授权管理员控件
     def _load_auth_data(self):
         """加载授权数据"""
+        yml_path = AUTH_DATA_FILE.replace('.json', '.yml')
+        self._migrate_yml_to_json(yml_path, AUTH_DATA_FILE)
         if os.path.exists(AUTH_DATA_FILE):
             try:
                 with open(AUTH_DATA_FILE, 'r', encoding='utf-8') as f:
-                    self.auth_data = yaml.safe_load(f) or {}
+                    self.auth_data = json.load(f)
             except Exception as e:
                 self._log_operation("error", f"加载授权数据失败: {str(e)}")
                 self.auth_data = {}
@@ -1287,14 +1344,14 @@ class ContractSystem(Star):
         """保存授权数据（添加错误处理）"""
         try:
             with open(AUTH_DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(self.auth_data, f, allow_unicode=True)
+                json.dump(self.auth_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self._log_operation("error", f"保存授权数据失败: {str(e)}")
             # 尝试创建目录后重试
             try:
                 os.makedirs(os.path.dirname(AUTH_DATA_FILE), exist_ok=True)
                 with open(AUTH_DATA_FILE, 'w', encoding='utf-8') as f:
-                    yaml.dump(self.auth_data, f, allow_unicode=True)
+                    json.dump(self.auth_data, f, ensure_ascii=False, indent=2)
             except Exception as e2:
                 self._log_operation("critical", f"重试保存授权数据失败: {str(e2)}")
                 raise
@@ -1318,10 +1375,12 @@ class ContractSystem(Star):
             
     def _load_blacklist_data(self):
         """加载黑名单数据"""
+        yml_path = BLACKLIST_DATA_FILE.replace('.json', '.yml')
+        self._migrate_yml_to_json(yml_path, BLACKLIST_DATA_FILE)
         if os.path.exists(BLACKLIST_DATA_FILE):
             try:
                 with open(BLACKLIST_DATA_FILE, 'r', encoding='utf-8') as f:
-                    return yaml.safe_load(f) or {"groups": [], "users": {}}
+                    return json.load(f)
             except Exception as e:
                 self._log_operation("error", f"加载黑名单数据失败: {str(e)}")
                 return {"groups": [], "users": {}}
@@ -1331,7 +1390,7 @@ class ContractSystem(Star):
         """保存黑名单数据"""
         try:
             with open(BLACKLIST_DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(self.blacklist_data, f, allow_unicode=True)
+                json.dump(self.blacklist_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self._log_operation("error", f"保存黑名单数据失败: {str(e)}")
     #endregion
@@ -1339,10 +1398,12 @@ class ContractSystem(Star):
     #region 资产与证件控件
     def _load_asset_data(self) -> dict:
         """加载资产数据"""
+        yml_path = ASSET_DATA_FILE.replace('.json', '.yml')
+        self._migrate_yml_to_json(yml_path, ASSET_DATA_FILE)
         if os.path.exists(ASSET_DATA_FILE):
             try:
                 with open(ASSET_DATA_FILE, 'r', encoding='utf-8') as f:
-                    return yaml.safe_load(f) or {}
+                    return json.load(f)
             except Exception as e:
                 self._log_operation("error", f"加载资产数据失败: {str(e)}")
                 return {}
@@ -1352,16 +1413,18 @@ class ContractSystem(Star):
         """保存资产数据"""
         try:
             with open(ASSET_DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True)
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self._log_operation("error", f"保存资产数据失败: {str(e)}")
 
     def _load_certificate_data(self) -> dict:
         """加载证件数据"""
+        yml_path = CERTIFICATE_DATA_FILE.replace('.json', '.yml')
+        self._migrate_yml_to_json(yml_path, CERTIFICATE_DATA_FILE)
         if os.path.exists(CERTIFICATE_DATA_FILE):
             try:
                 with open(CERTIFICATE_DATA_FILE, 'r', encoding='utf-8') as f:
-                    return yaml.safe_load(f) or {}
+                    return json.load(f)
             except Exception as e:
                 self._log_operation("error", f"加载证件数据失败: {str(e)}")
                 return {}
@@ -1371,13 +1434,23 @@ class ContractSystem(Star):
         """保存证件数据"""
         try:
             with open(CERTIFICATE_DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True)
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self._log_operation("error", f"保存证件数据失败: {str(e)}")
     #endregion
 
     async def terminate(self):
         """插件卸载时调用"""
+        # 刷新所有脏数据到磁盘
+        for file_path in list(self._dirty):
+            self._flush_file(file_path)
+        self._cache.clear()
+        self._dirty.clear()
+        
+        # 关闭HTTP客户端
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
+        
         # 生成新的令牌使旧任务自动退出
         self.task_token = str(uuid.uuid4())
         
@@ -1389,6 +1462,9 @@ class ContractSystem(Star):
         
         if hasattr(self, 'stock_refresh_task') and not self.stock_refresh_task.done():
             tasks_to_cancel.append(self.stock_refresh_task)
+        
+        if hasattr(self, '_flush_task') and not self._flush_task.done():
+            tasks_to_cancel.append(self._flush_task)
         
         # 取消任务
         for task in tasks_to_cancel:
@@ -1447,10 +1523,10 @@ class ContractSystem(Star):
             # 创建背景
             try:
                 # 使用异步HTTP客户端获取背景
-                async with httpx.AsyncClient() as client:
-                    bg_response = await client.get(self.BG_API, timeout=10)
-                    bg_response.raise_for_status()
-                    bg = PILImage.open(BytesIO(bg_response.content))
+                client = self._get_http_client()
+                bg_response = await client.get(self.BG_API)
+                bg_response.raise_for_status()
+                bg = PILImage.open(BytesIO(bg_response.content))
                 
                 # 调整背景图尺寸，保持宽高比
                 bg_ratio = bg.width / bg.height
@@ -1484,15 +1560,9 @@ class ContractSystem(Star):
             draw = ImageDraw.Draw(bg)
             
             # 加载字体
-            try:
-                title_font = ImageFont.truetype(FONT_PATH, 42)
-                text_font = ImageFont.truetype(FONT_PATH, 32)
-                footer_font = ImageFont.truetype(FONT_PATH, 28)
-            except:
-                # 使用默认字体
-                title_font = ImageFont.load_default()
-                text_font = ImageFont.load_default()
-                footer_font = ImageFont.load_default()
+            title_font = self._get_font(42)
+            text_font = self._get_font(32)
+            footer_font = self._get_font(28)
             
             # 绘制标题
             title_width = title_font.getlength(title)
@@ -1536,70 +1606,75 @@ class ContractSystem(Star):
         return image_paths
 
     async def _get_avatar(self, user_id: str) -> Optional[PILImage.Image]:
-        """异步获取用户头像"""
+        """异步获取用户头像（带缓存，5分钟TTL）"""
+        now = time.time()
+        if user_id in self._avatar_cache:
+            cached_avatar, cache_time = self._avatar_cache[user_id]
+            if now - cache_time < 300:  # 5分钟缓存
+                return cached_avatar.copy()
+        
         try:
-            async with httpx.AsyncClient() as client:
-                # 使用QQ头像API
-                avatar_url = AVATAR_API.format(user_id)
-                response = await client.get(avatar_url, timeout=10)
-                response.raise_for_status()
-                
-                # 处理头像图片
-                avatar = PILImage.open(BytesIO(response.content))
-                avatar = avatar.resize((160, 160))
-                
-                # 创建圆形遮罩
-                mask = PILImage.new('L', (160, 160), 0)
-                draw = ImageDraw.Draw(mask)
-                draw.ellipse((0, 0, 160, 160), fill=255)
-                
-                # 应用遮罩
-                avatar.putalpha(mask)
-                return avatar
+            client = self._get_http_client()
+            avatar_url = AVATAR_API.format(user_id)
+            response = await client.get(avatar_url)
+            response.raise_for_status()
+            
+            avatar = PILImage.open(BytesIO(response.content))
+            avatar = avatar.resize((160, 160))
+            
+            mask = PILImage.new('L', (160, 160), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.ellipse((0, 0, 160, 160), fill=255)
+            avatar.putalpha(mask)
+            
+            self._avatar_cache[user_id] = (avatar.copy(), now)
+            # 限制缓存大小
+            if len(self._avatar_cache) > 100:
+                oldest = min(self._avatar_cache.items(), key=lambda x: x[1][1])
+                del self._avatar_cache[oldest[0]]
+            
+            return avatar
         except Exception as e:
             self._log_operation("warning", f"获取头像失败: {user_id} - {str(e)}")
             return None
         
     async def _get_background(self, width: int, height: int) -> PILImage.Image:
-        """异步获取背景图片"""
+        """异步获取背景图片（带缓存，2分钟TTL）"""
+        now = time.time()
+        if self._bg_cache is not None and (now - self._bg_cache_time) < 120:
+            bg = self._bg_cache.copy()
+            if bg.size != (width, height):
+                bg = bg.resize((width, height), PILImage.Resampling.LANCZOS)
+            return bg
+        
         try:
-            async with httpx.AsyncClient() as client:
-                # 使用背景图API
-                response = await client.get(self.BG_API, timeout=10)
-                response.raise_for_status()
-                
-                # 处理背景图片
-                bg = PILImage.open(BytesIO(response.content))
-                
-                # 计算目标比例和原始比例
-                target_ratio = width / height
-                bg_ratio = bg.width / bg.height
-                
-                # 根据比例差异决定缩放方式
-                if bg_ratio > target_ratio:
-                    # 背景图更宽，以高度为基准缩放
-                    new_height = height
-                    new_width = int(new_height * bg_ratio)
-                else:
-                    # 背景图更高，以宽度为基准缩放
-                    new_width = width
-                    new_height = int(new_width / bg_ratio)
-                
-                # 调整背景图尺寸
-                bg = bg.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
-                
-                # 计算裁剪区域（确保居中）
-                left = (new_width - width) // 2
-                top = (new_height - height) // 2
-                right = left + width
-                bottom = top + height
-                
-                # 裁剪到目标尺寸
-                bg = bg.crop((left, top, right, bottom))
-                
-                return bg
+            client = self._get_http_client()
+            response = await client.get(self.BG_API)
+            response.raise_for_status()
+            
+            bg = PILImage.open(BytesIO(response.content))
+            target_ratio = width / height
+            bg_ratio = bg.width / bg.height
+            
+            if bg_ratio > target_ratio:
+                new_height = height
+                new_width = int(new_height * bg_ratio)
+            else:
+                new_width = width
+                new_height = int(new_width / bg_ratio)
+            
+            bg = bg.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+            left = (new_width - width) // 2
+            top = (new_height - height) // 2
+            right = left + width
+            bottom = top + height
+            bg = bg.crop((left, top, right, bottom))
+            
+            self._bg_cache = bg.copy()
+            self._bg_cache_time = now
+            
+            return bg
         except Exception:
-            # 使用纯色背景作为备选
             return PILImage.new("RGB", (width, height), color="#F0F8FF")
 
     #endregion
@@ -1632,8 +1707,8 @@ class ContractSystem(Star):
             canvas.paste(avatar, (60, avatar_y), avatar)
 
         # 基础信息
-        info_font = ImageFont.truetype(FONT_PATH, 28) if os.path.exists(FONT_PATH) else ImageFont.load_default()
-        name_font = ImageFont.truetype(FONT_PATH, 36) if os.path.exists(FONT_PATH) else ImageFont.load_default()
+        info_font = self._get_font(28)
+        name_font = self._get_font(36)
         
         draw.text(
             (260, info_start_y), 
@@ -1702,7 +1777,7 @@ class ContractSystem(Star):
         right_panel = create_rounded_panel((PANEL_WIDTH, PANEL_HEIGHT), (255,255,255,150))
         canvas.paste(right_panel, (right_panel_x, panel_y), right_panel)
         
-        title_font = ImageFont.truetype(FONT_PATH, 24) if os.path.exists(FONT_PATH) else info_font
+        title_font = self._get_font(24)
         title_text = "预计收入" if data.get('is_query') else "今日收益"
         draw.text((right_panel_x+20, panel_y+20), title_text, font=title_font, fill="#333333")
 
@@ -1743,7 +1818,7 @@ class ContractSystem(Star):
                 draw.text(
                     (right_panel_x + PANEL_WIDTH//2 - text_width//2, y_position),
                     line,
-                    font=ImageFont.truetype(FONT_PATH, 24) if os.path.exists(FONT_PATH) else detail_font,
+                    font=self._get_font(24),
                     fill="#FF4500"
                 )
             else:
@@ -1789,7 +1864,7 @@ class ContractSystem(Star):
             draw.text(
                 (x, BOTTOM_TOP+30), 
                 title, 
-                font=ImageFont.truetype(FONT_PATH, 28) if os.path.exists(FONT_PATH) else info_font, 
+                font=self._get_font(28), 
                 fill="#333333"
             )
             
@@ -1797,11 +1872,11 @@ class ContractSystem(Star):
             draw.text(
                 (x, BOTTOM_TOP+80), 
                 value, 
-                font=ImageFont.truetype(FONT_PATH, 28) if os.path.exists(FONT_PATH) else info_font, 
+                font=self._get_font(28), 
                 fill="#000000"
             )
         
-        copyright_font = ImageFont.truetype(FONT_PATH, 24) if os.path.exists(FONT_PATH) else info_font
+        copyright_font = self._get_font(24)
         copyright_text = "by HINS"
         text_bbox = copyright_font.getbbox(copyright_text)
         draw.text(
@@ -1826,35 +1901,35 @@ class ContractSystem(Star):
         
         # 异步获取背景（优化：等比缩放+居中裁剪避免变形）
         try:
-            async with httpx.AsyncClient() as client:
-                bg_response = await client.get(self.BG_API, timeout=10)
-                bg = PILImage.open(BytesIO(bg_response.content))
-                
-                # 计算目标比例和原始图片比例
-                target_ratio = width / height  # 画布宽高比
-                bg_ratio = bg.width / bg.height  # 背景图宽高比
-                
-                # 根据比例差异决定缩放基准
-                if bg_ratio > target_ratio:
-                    # 背景图更宽，以画布高度为基准缩放，保证高度填满
-                    new_height = height
-                    new_width = int(new_height * bg_ratio)
-                else:
-                    # 背景图更高，以画布宽度为基准缩放，保证宽度填满
-                    new_width = width
-                    new_height = int(new_width / bg_ratio)
-                
-                # 高质量等比缩放（使用LANCZOS算法）
-                bg = bg.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
-                
-                # 计算居中裁剪区域（裁剪掉超出画布的部分）
-                left = (new_width - width) // 2
-                top = (new_height - height) // 2
-                right = left + width
-                bottom = top + height
-                
-                # 裁剪到目标画布尺寸
-                bg = bg.crop((left, top, right, bottom))
+            client = self._get_http_client()
+            bg_response = await client.get(self.BG_API)
+            bg = PILImage.open(BytesIO(bg_response.content))
+            
+            # 计算目标比例和原始图片比例
+            target_ratio = width / height  # 画布宽高比
+            bg_ratio = bg.width / bg.height  # 背景图宽高比
+            
+            # 根据比例差异决定缩放基准
+            if bg_ratio > target_ratio:
+                # 背景图更宽，以画布高度为基准缩放，保证高度填满
+                new_height = height
+                new_width = int(new_height * bg_ratio)
+            else:
+                # 背景图更高，以画布宽度为基准缩放，保证宽度填满
+                new_width = width
+                new_height = int(new_width / bg_ratio)
+            
+            # 高质量等比缩放（使用LANCZOS算法）
+            bg = bg.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+            
+            # 计算居中裁剪区域（裁剪掉超出画布的部分）
+            left = (new_width - width) // 2
+            top = (new_height - height) // 2
+            right = left + width
+            bottom = top + height
+            
+            # 裁剪到目标画布尺寸
+            bg = bg.crop((left, top, right, bottom))
         except Exception:
             bg = PILImage.new("RGB", (width, height), color="#F0F8FF")  # 浅蓝色背景兜底
         
@@ -1870,7 +1945,7 @@ class ContractSystem(Star):
         draw = ImageDraw.Draw(canvas)
         
         # 主标题
-        title_font = ImageFont.truetype(FONT_PATH, 48)
+        self._get_font(title_font)
         title = "契约关系"
         text_bbox = title_font.getbbox(title)
         title_width = text_bbox[2] - text_bbox[0]
@@ -1884,7 +1959,7 @@ class ContractSystem(Star):
         )
         
         # 用户信息
-        user_font = ImageFont.truetype(FONT_PATH, 36)
+        self._get_font(user_font)
         user_info = f"{data['user_name']} ({data['user_id']})"
         draw.text(
             (100, 100), 
@@ -1894,7 +1969,7 @@ class ContractSystem(Star):
         )
         
         # 显示状态
-        status_font = ImageFont.truetype(FONT_PATH, 28)
+        self._get_font(status_font)
         if data.get('is_permanent', False):
             status_text = "永久性奴"
             status_color = "#FF0000"  # 红色
@@ -1911,7 +1986,7 @@ class ContractSystem(Star):
         master_panel = create_rounded_panel((900, 80), (255, 240, 245, 200))  # 浅粉色
         canvas.paste(master_panel, (90, 160), master_panel)
         
-        master_font = ImageFont.truetype(FONT_PATH, 32)
+        self._get_font(master_font)
         if data['master_info']:
             master_id, master_name = data['master_info']
             master_text = f"主人: {master_name} ({master_id})"
@@ -1929,7 +2004,7 @@ class ContractSystem(Star):
         canvas.paste(list_panel, (90, 300), list_panel)
         
         # 显示性奴列表（最多8个）
-        list_font = ImageFont.truetype(FONT_PATH, 28)
+        self._get_font(list_font)
         y_position = 320
         for i, (cid, cname) in enumerate(data['contractors']):
             if i >= 8:  # 最多显示8个
@@ -1965,13 +2040,13 @@ class ContractSystem(Star):
             draw.text((130, y_position + 10), more_text, font=list_font, fill="#666666")
         
         # 底部信息
-        footer_font = ImageFont.truetype(FONT_PATH, 24)
+        self._get_font(footer_font)
         draw.text((100, 670), "购买性奴: 购买@用户", font=footer_font, fill="#666666")  # 橄榄绿
         draw.text((400, 670), "出售性奴: 出售@用户", font=footer_font, fill="#666666")
         draw.text((700, 670), "解除契约: /赎身", font=footer_font, fill="#666666")
         
         # 版权信息
-        copyright_font = ImageFont.truetype(FONT_PATH, 20)
+        self._get_font(copyright_font)
         copyright_text = "by HINS"
         text_bbox = copyright_font.getbbox(copyright_text)
         draw.text(
@@ -1996,35 +2071,35 @@ class ContractSystem(Star):
         
         # 异步获取背景
         try:
-            async with httpx.AsyncClient() as client:
-                bg_response = await client.get(self.BG_API, timeout=10)
-                bg = PILImage.open(BytesIO(bg_response.content))
-                
-                # 计算目标比例和原始比例
-                target_ratio = width / height
-                bg_ratio = bg.width / bg.height
-                
-                # 根据比例差异决定缩放方式
-                if bg_ratio > target_ratio:
-                    # 背景图更宽，以高度为基准缩放
-                    new_height = height
-                    new_width = int(new_height * bg_ratio)
-                else:
-                    # 背景图更高，以宽度为基准缩放
-                    new_width = width
-                    new_height = int(new_width / bg_ratio)
-                
-                # 调整背景图尺寸
-                bg = bg.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
-                
-                # 计算裁剪区域（确保居中）
-                left = (new_width - width) // 2
-                top = (new_height - height) // 2
-                right = left + width
-                bottom = top + height
-                
-                # 裁剪到目标尺寸
-                bg = bg.crop((left, top, right, bottom))
+            client = self._get_http_client()
+            bg_response = await client.get(self.BG_API)
+            bg = PILImage.open(BytesIO(bg_response.content))
+            
+            # 计算目标比例和原始比例
+            target_ratio = width / height
+            bg_ratio = bg.width / bg.height
+            
+            # 根据比例差异决定缩放方式
+            if bg_ratio > target_ratio:
+                # 背景图更宽，以高度为基准缩放
+                new_height = height
+                new_width = int(new_height * bg_ratio)
+            else:
+                # 背景图更高，以宽度为基准缩放
+                new_width = width
+                new_height = int(new_width / bg_ratio)
+            
+            # 调整背景图尺寸
+            bg = bg.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+            
+            # 计算裁剪区域（确保居中）
+            left = (new_width - width) // 2
+            top = (new_height - height) // 2
+            right = left + width
+            bottom = top + height
+            
+            # 裁剪到目标尺寸
+            bg = bg.crop((left, top, right, bottom))
         except Exception:
             bg = PILImage.new("RGB", (width, height), color="#F0F8FF")  # 浅蓝色背景
 
@@ -2042,7 +2117,7 @@ class ContractSystem(Star):
         draw = ImageDraw.Draw(canvas)
         
         # 主标题
-        title_font = ImageFont.truetype(FONT_PATH, 48)
+        self._get_font(title_font)
         title = f"{data['user_name']}的资产核查"
         text_bbox = title_font.getbbox(title)
         title_width = text_bbox[2] - text_bbox[0]
@@ -2056,12 +2131,12 @@ class ContractSystem(Star):
         )
         
         # 用户信息
-        user_font = ImageFont.truetype(FONT_PATH, 36)
+        self._get_font(user_font)
         user_info = f"QQ: {data['user_id']}"
         draw.text((100, 100), user_info, font=user_font, fill="#000080")  # 深蓝色
         
         # 财富等级信息
-        wealth_font = ImageFont.truetype(FONT_PATH, 32)
+        self._get_font(wealth_font)
         wealth_text = f"财富等级: {data['wealth_level']} (加成率: {data['wealth_rate']*100:.0f}%)"
         draw.text((100, 150), wealth_text, font=wealth_font, fill="#8B4513")  # 深棕色
         
@@ -2070,7 +2145,7 @@ class ContractSystem(Star):
         canvas.paste(asset_panel, (90, 200), asset_panel)
         
         # 资产标题
-        title_font = ImageFont.truetype(FONT_PATH, 36)
+        self._get_font(title_font)
         draw.text((120, 220), "资产类型", font=title_font, fill="#8B0000")  # 深红色
         draw.text((550, 220), "金额", font=title_font, fill="#8B0000")
         
@@ -2086,7 +2161,7 @@ class ContractSystem(Star):
         ]
         
         # 显示资产项目
-        entry_font = ImageFont.truetype(FONT_PATH, 32)
+        self._get_font(entry_font)
         y_position = 290
         for i, (name, amount) in enumerate(asset_items):
             # 交替行颜色
@@ -2100,7 +2175,7 @@ class ContractSystem(Star):
             # 资产金额（总资产特殊显示）
             if name == "💎 总资产":
                 amount_color = "#FF4500"  # 橙红色
-                amount_font = ImageFont.truetype(FONT_PATH, 36)
+                self._get_font(amount_font)
             else:
                 amount_color = "#228B22"  # 森林绿
                 amount_font = entry_font
@@ -2130,13 +2205,13 @@ class ContractSystem(Star):
         )
         
         # 底部信息
-        footer_font = ImageFont.truetype(FONT_PATH, 24)
+        self._get_font(footer_font)
         draw.text((100, 670), "查询个人资产: /签到查询", font=footer_font, fill="#666666")
         draw.text((400, 670), "金币排行榜: /金币排行榜", font=footer_font, fill="#666666")
         draw.text((700, 670), "性奴排行榜: /性奴排行榜", font=footer_font, fill="#666666")
         
         # 版权信息
-        copyright_font = ImageFont.truetype(FONT_PATH, 20)
+        self._get_font(copyright_font)
         copyright_text = "by HINS"
         text_bbox = copyright_font.getbbox(copyright_text)
         draw.text(
@@ -2161,35 +2236,35 @@ class ContractSystem(Star):
         
         # 异步获取背景
         try:
-            async with httpx.AsyncClient() as client:
-                bg_response = await client.get(self.BG_API, timeout=10)
-                bg = PILImage.open(BytesIO(bg_response.content))
-                
-                # 计算目标比例和原始比例
-                target_ratio = width / height
-                bg_ratio = bg.width / bg.height
-                
-                # 根据比例差异决定缩放方式
-                if bg_ratio > target_ratio:
-                    # 背景图更宽，以高度为基准缩放
-                    new_height = height
-                    new_width = int(new_height * bg_ratio)
-                else:
-                    # 背景图更高，以宽度为基准缩放
-                    new_width = width
-                    new_height = int(new_width / bg_ratio)
-                
-                # 调整背景图尺寸
-                bg = bg.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
-                
-                # 计算裁剪区域（确保居中）
-                left = (new_width - width) // 2
-                top = (new_height - height) // 2
-                right = left + width
-                bottom = top + height
-                
-                # 裁剪到目标尺寸
-                bg = bg.crop((left, top, right, bottom))
+            client = self._get_http_client()
+            bg_response = await client.get(self.BG_API)
+            bg = PILImage.open(BytesIO(bg_response.content))
+            
+            # 计算目标比例和原始比例
+            target_ratio = width / height
+            bg_ratio = bg.width / bg.height
+            
+            # 根据比例差异决定缩放方式
+            if bg_ratio > target_ratio:
+                # 背景图更宽，以高度为基准缩放
+                new_height = height
+                new_width = int(new_height * bg_ratio)
+            else:
+                # 背景图更高，以宽度为基准缩放
+                new_width = width
+                new_height = int(new_width / bg_ratio)
+            
+            # 调整背景图尺寸
+            bg = bg.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+            
+            # 计算裁剪区域（确保居中）
+            left = (new_width - width) // 2
+            top = (new_height - height) // 2
+            right = left + width
+            bottom = top + height
+            
+            # 裁剪到目标尺寸
+            bg = bg.crop((left, top, right, bottom))
         except Exception:
             bg = PILImage.new("RGB", (width, height), color="#F0F8FF")  # 浅蓝色背景
 
@@ -2206,7 +2281,7 @@ class ContractSystem(Star):
         draw = ImageDraw.Draw(canvas)
         
         # 主标题
-        title_font = ImageFont.truetype(FONT_PATH, 48)
+        self._get_font(title_font)
         title = "性奴排行榜"
         text_bbox = title_font.getbbox(title)
         title_width = text_bbox[2] - text_bbox[0]
@@ -2220,7 +2295,7 @@ class ContractSystem(Star):
         )
         
         # 副标题
-        subtitle_font = ImageFont.truetype(FONT_PATH, 32)
+        self._get_font(subtitle_font)
         subtitle = "拥有性奴数量"
         text_bbox = subtitle_font.getbbox(subtitle)
         subtitle_width = text_bbox[2] - text_bbox[0]
@@ -2238,7 +2313,7 @@ class ContractSystem(Star):
         canvas.paste(list_panel, (90, 150), list_panel)
         
         # 表头
-        header_font = ImageFont.truetype(FONT_PATH, 28)
+        self._get_font(header_font)
         headers = [("排名", 120), ("用户", 220), ("性奴数量", 700)]
         for text, x in headers:
             draw.text((x, 170), text, font=header_font, fill="#8B0000")  # 深红色
@@ -2247,7 +2322,7 @@ class ContractSystem(Star):
         draw.line([(100, 200), (980, 200)], fill="#8B0000", width=2)
         
         # 显示排行榜条目
-        entry_font = ImageFont.truetype(FONT_PATH, 28)
+        self._get_font(entry_font)
         y_position = 220
         
         # 排名颜色配置
@@ -2272,7 +2347,7 @@ class ContractSystem(Star):
             
             # 性奴数量（前三名特殊显示）
             if rank <= 3:
-                count_font = ImageFont.truetype(FONT_PATH, 32)
+                self._get_font(count_font)
             else:
                 count_font = entry_font
             
@@ -2288,11 +2363,11 @@ class ContractSystem(Star):
             y_position += 45
         
         # 底部信息
-        footer_font = ImageFont.truetype(FONT_PATH, 24)
+        self._get_font(footer_font)
         draw.text((100, 670), "管理契约: /我的契约", font=footer_font, fill="#666666")
         
         # 版权信息
-        copyright_font = ImageFont.truetype(FONT_PATH, 20)
+        self._get_font(copyright_font)
         copyright_text = "by HINS"
         text_bbox = copyright_font.getbbox(copyright_text)
         draw.text(
@@ -2317,35 +2392,35 @@ class ContractSystem(Star):
         
         # 异步获取背景
         try:
-            async with httpx.AsyncClient() as client:
-                bg_response = await client.get(self.BG_API, timeout=10)
-                bg = PILImage.open(BytesIO(bg_response.content))
-                
-                # 计算目标比例和原始比例
-                target_ratio = width / height
-                bg_ratio = bg.width / bg.height
-                
-                # 根据比例差异决定缩放方式
-                if bg_ratio > target_ratio:
-                    # 背景图更宽，以高度为基准缩放
-                    new_height = height
-                    new_width = int(new_height * bg_ratio)
-                else:
-                    # 背景图更高，以宽度为基准缩放
-                    new_width = width
-                    new_height = int(new_width / bg_ratio)
-                
-                # 调整背景图尺寸
-                bg = bg.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
-                
-                # 计算裁剪区域（确保居中）
-                left = (new_width - width) // 2
-                top = (new_height - height) // 2
-                right = left + width
-                bottom = top + height
-                
-                # 裁剪到目标尺寸
-                bg = bg.crop((left, top, right, bottom))
+            client = self._get_http_client()
+            bg_response = await client.get(self.BG_API)
+            bg = PILImage.open(BytesIO(bg_response.content))
+            
+            # 计算目标比例和原始比例
+            target_ratio = width / height
+            bg_ratio = bg.width / bg.height
+            
+            # 根据比例差异决定缩放方式
+            if bg_ratio > target_ratio:
+                # 背景图更宽，以高度为基准缩放
+                new_height = height
+                new_width = int(new_height * bg_ratio)
+            else:
+                # 背景图更高，以宽度为基准缩放
+                new_width = width
+                new_height = int(new_width / bg_ratio)
+            
+            # 调整背景图尺寸
+            bg = bg.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+            
+            # 计算裁剪区域（确保居中）
+            left = (new_width - width) // 2
+            top = (new_height - height) // 2
+            right = left + width
+            bottom = top + height
+            
+            # 裁剪到目标尺寸
+            bg = bg.crop((left, top, right, bottom))
         except Exception:
             bg = PILImage.new("RGB", (width, height), color="#F0F8FF")  # 浅蓝色背景
 
@@ -2362,7 +2437,7 @@ class ContractSystem(Star):
         draw = ImageDraw.Draw(canvas)
         
         # 主标题
-        title_font = ImageFont.truetype(FONT_PATH, 48)
+        self._get_font(title_font)
         title = "金币排行榜"
         text_bbox = title_font.getbbox(title)
         title_width = text_bbox[2] - text_bbox[0]
@@ -2376,7 +2451,7 @@ class ContractSystem(Star):
         )
         
         # 副标题
-        subtitle_font = ImageFont.truetype(FONT_PATH, 32)
+        self._get_font(subtitle_font)
         subtitle = "总资产（现金+银行+牛牛金币）"
         text_bbox = subtitle_font.getbbox(subtitle)
         subtitle_width = text_bbox[2] - text_bbox[0]
@@ -2394,7 +2469,7 @@ class ContractSystem(Star):
         canvas.paste(list_panel, (90, 150), list_panel)
         
         # 表头
-        header_font = ImageFont.truetype(FONT_PATH, 28)
+        self._get_font(header_font)
         headers = [("排名", 120), ("用户", 220), ("总资产", 700)]
         for text, x in headers:
             draw.text((x, 170), text, font=header_font, fill="#8B0000")  # 深红色
@@ -2403,7 +2478,7 @@ class ContractSystem(Star):
         draw.line([(100, 200), (980, 200)], fill="#8B0000", width=2)
         
         # 显示排行榜条目
-        entry_font = ImageFont.truetype(FONT_PATH, 28)
+        self._get_font(entry_font)
         y_position = 220
         
         # 排名颜色配置
@@ -2428,7 +2503,7 @@ class ContractSystem(Star):
             
             # 财富金额（前三名特殊显示）
             if rank <= 3:
-                wealth_font = ImageFont.truetype(FONT_PATH, 32)
+                self._get_font(wealth_font)
             else:
                 wealth_font = entry_font
             
@@ -2444,11 +2519,11 @@ class ContractSystem(Star):
             y_position += 45
         
         # 底部信息
-        footer_font = ImageFont.truetype(FONT_PATH, 24)
+        self._get_font(footer_font)
         draw.text((100, 670), "查看个人资产: /签到查询", font=footer_font, fill="#666666")
         
         # 版权信息
-        copyright_font = ImageFont.truetype(FONT_PATH, 20)
+        self._get_font(copyright_font)
         copyright_text = "by HINS"
         text_bbox = copyright_font.getbbox(copyright_text)
         draw.text(
@@ -2487,10 +2562,10 @@ class ContractSystem(Star):
         
         # 加载字体
         try:
-            title_font = ImageFont.truetype(FONT_PATH, 42)
-            name_font = ImageFont.truetype(FONT_PATH, 32)
-            info_font = ImageFont.truetype(FONT_PATH, 24)
-            small_font = ImageFont.truetype(FONT_PATH, 20)
+            self._get_font(title_font)
+            self._get_font(name_font)
+            self._get_font(info_font)
+            self._get_font(small_font)
         except:
             # 使用默认字体
             title_font = ImageFont.load_default()
@@ -3071,8 +3146,7 @@ class ContractSystem(Star):
         # 保存数据
         try:
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[employer_id] = employer
             group_data[target_id] = target_user
@@ -3115,8 +3189,7 @@ class ContractSystem(Star):
         # 保存数据
         try:
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[employer_id] = employer
             group_data[target_id] = target_user
@@ -3194,8 +3267,7 @@ class ContractSystem(Star):
         # 保存数据
         try:
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[user_id] = user_data
             group_data[employer_id] = employer
@@ -3298,8 +3370,7 @@ class ContractSystem(Star):
             # 保存数据
             try:
                 # 保存主数据
-                with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                    data = yaml.safe_load(f) or {}
+                data = self._load_data()
                 group_data = data.setdefault(group_id, {})
                 group_data[robber_id] = robber_data
                 group_data[target_id] = target_data
@@ -3333,8 +3404,7 @@ class ContractSystem(Star):
             # 保存数据
             try:
                 # 保存主数据
-                with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                    data = yaml.safe_load(f) or {}
+                data = self._load_data()
                 group_data = data.setdefault(group_id, {})
                 group_data[robber_id] = robber_data
                 self._save_data(data)
@@ -3415,8 +3485,7 @@ class ContractSystem(Star):
         # 保存数据
         try:
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[sender_id] = sender_data
             group_data[target_id] = receiver_data
@@ -3514,8 +3583,7 @@ class ContractSystem(Star):
         # 保存数据
         try:
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[user_id] = user_data
             self._save_data(data)
@@ -3572,8 +3640,7 @@ class ContractSystem(Star):
         # 保存数据
         try:
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[user_id] = user_data
             self._save_data(data)
@@ -3915,13 +3982,9 @@ class ContractSystem(Star):
             return
         
         # 加载数据
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-        except Exception as e:
-            self._log_operation("error", f"加载排行榜数据失败: {str(e)}")
-            data = {}
+        data = self._load_data()
         
+
         group_data = data.get(group_id, {})
         
         # 加载牛牛插件数据
@@ -3929,8 +3992,14 @@ class ContractSystem(Star):
         niuniu_data_path = os.path.join('data', 'niuniu_lengths.yml')
         if os.path.exists(niuniu_data_path):
             try:
-                with open(niuniu_data_path, 'r', encoding='utf-8') as f:
-                    niuniu_data = yaml.safe_load(f) or {}
+                # 优先使用缓存
+                if self._niuniu_cache is not None:
+                    niuniu_data = self._niuniu_cache
+                else:
+                    with open(niuniu_data_path, 'r', encoding='utf-8') as f:
+                        niuniu_data = yaml.safe_load(f) or {}
+                    self._niuniu_cache = niuniu_data
+                    self._niuniu_cache_time = time.time()
             except Exception as e:
                 self._log_operation("error", f"加载牛牛排行榜数据失败: {str(e)}")
                 pass
@@ -3980,12 +4049,7 @@ class ContractSystem(Star):
             return
 
         # 加载数据
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-        except Exception as e:
-            self._log_operation("error", f"加载性奴排行榜数据失败: {str(e)}")
-            data = {}
+        data = self._load_data()
         
         group_data = data.get(group_id, {})
         
@@ -4131,8 +4195,7 @@ class ContractSystem(Star):
         # 保存数据
         try:
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[employer_id] = employer_data
             group_data[target_id] = target_data
@@ -4306,8 +4369,7 @@ class ContractSystem(Star):
         # 保存雇主数据
         try:
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[employer_id] = employer_data
             self._save_data(data)
@@ -4669,8 +4731,7 @@ class ContractSystem(Star):
         # 保存数据
         try:
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[user_id] = user_data
             self._save_data(data)
@@ -4858,8 +4919,7 @@ class ContractSystem(Star):
         # 保存数据
         try:
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[user_id] = user_data
             self._save_data(data)
@@ -5073,8 +5133,7 @@ class ContractSystem(Star):
             self._update_user_props(group_id, user_id, user_props)
             
             # 保存用户数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[user_id] = user_data
             group_data[target_id] = target_data
@@ -5167,8 +5226,7 @@ class ContractSystem(Star):
             self._update_user_props(group_id, user_id, user_props)
             
             # 保存用户数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[user_id] = employer_data
             group_data[target_id] = target_data
@@ -5282,12 +5340,7 @@ class ContractSystem(Star):
                 return
 
         # 加载全群数据
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-        except Exception as e:
-            self._log_operation("error", f"加载红星制裁数据失败: {str(e)}")
-            data = {}
+        data = self._load_data()
 
         group_data = data.get(group_id, {})
         if not group_data:
@@ -5418,8 +5471,7 @@ class ContractSystem(Star):
             self._update_user_props(group_id, user_id, user_props)
 
             # 保存用户数据
-            with open(DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True)
+            self._save_data(data)
                 
             # 保存时间数据
             self._save_user_time_data(group_id, user_id, time_data)
@@ -5494,8 +5546,7 @@ class ContractSystem(Star):
         target_loss_amount = target_total_assets * target_loss_percent
 
         # 加载群组数据
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f) or {}
+        data = self._load_data()
         group_data = data.setdefault(group_id, {})
         group_data[user_id] = user_data
         group_data[target_id] = target_data
@@ -5625,8 +5676,7 @@ class ContractSystem(Star):
             self._update_user_props(group_id, user_id, user_props)
 
             # 保存用户数据
-            with open(DATA_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True)
+            self._save_data(data)
                 
             # 保存时间数据
             self._save_user_time_data(group_id, user_id, time_data)
@@ -5732,8 +5782,7 @@ class ContractSystem(Star):
             self._update_user_props(group_id, user_id, user_props)
             
             # 保存主数据
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[user_id] = user_data
             self._save_data(data)
@@ -8684,8 +8733,7 @@ class ContractSystem(Star):
     def _save_user_data(self, group_id: str, user_id: str, user_data: dict):
         """保存用户数据"""
         try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+            data = self._load_data()
             group_data = data.setdefault(group_id, {})
             group_data[user_id] = user_data
             self._save_data(data)
